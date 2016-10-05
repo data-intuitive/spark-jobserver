@@ -1,57 +1,66 @@
 package spark.jobserver.io
 
-import com.typesafe.config.{ConfigRenderOptions, Config, ConfigFactory}
-import java.io.{FileOutputStream, BufferedOutputStream, File}
+import java.io.File
 import java.sql.Timestamp
 import javax.sql.DataSource
+
+import com.typesafe.config.{Config, ConfigFactory, ConfigRenderOptions}
+import org.apache.commons.dbcp.BasicDataSource
 import org.flywaydb.core.Flyway
 import org.joda.time.DateTime
 import org.slf4j.LoggerFactory
-import scala.slick.driver.JdbcProfile
-import scala.reflect.runtime.universe
-import org.apache.commons.dbcp.BasicDataSource
+import slick.driver.JdbcProfile
 
-class JobSqlDAO(config: Config) extends JobDAO {
+import scala.concurrent.ExecutionContext.Implicits.global
+import scala.concurrent.duration._
+import scala.concurrent.{Await, Future}
+import scala.reflect.runtime.universe
+
+class JobSqlDAO(config: Config) extends JobDAO with FileCasher {
   val slickDriverClass = config.getString("spark.jobserver.sqldao.slick-driver")
   val jdbcDriverClass = config.getString("spark.jobserver.sqldao.jdbc-driver")
 
   val runtimeMirror = universe.runtimeMirror(getClass.getClassLoader)
   val profileModule = runtimeMirror.staticModule(slickDriverClass)
   val profile = runtimeMirror.reflectModule(profileModule).instance.asInstanceOf[JdbcProfile]
-  import profile.simple._
+
+  import profile.api._
 
   private val logger = LoggerFactory.getLogger(getClass)
 
   // NOTE: below is only needed for H2 drivers
-  private val rootDir = config.getString("spark.jobserver.sqldao.rootdir")
-  private val rootDirFile = new File(rootDir)
+  val rootDir = config.getString("spark.jobserver.sqldao.rootdir")
+  val rootDirFile = new File(rootDir)
   logger.info("rootDir is " + rootDirFile.getAbsolutePath)
 
   // Definition of the tables
   //scalastyle:off
-  class Jars(tag: Tag) extends Table[(Int, String, Timestamp, Array[Byte])](tag, "JARS") {
-    def jarId = column[Int]("JAR_ID", O.PrimaryKey, O.AutoInc)
+  class Binaries(tag: Tag) extends Table[(Int, String, String, Timestamp, Array[Byte])](tag, "BINARIES") {
+    def binId = column[Int]("BIN_ID", O.PrimaryKey, O.AutoInc)
     def appName = column[String]("APP_NAME")
+    def binaryType = column[String]("BINARY_TYPE")
     def uploadTime = column[Timestamp]("UPLOAD_TIME")
-    def jar = column[Array[Byte]]("JAR")
-    // Every table needs a * projection with the same type as the table's type parameter
-    def * = (jarId, appName, uploadTime, jar)
+    def binary = column[Array[Byte]]("BINARY")
+    def * = (binId, appName, binaryType, uploadTime, binary)
   }
-  val jars = TableQuery[Jars]
+
+  val binaries = TableQuery[Binaries]
 
   // Explicitly avoiding to label 'jarId' as a foreign key to avoid dealing with
   // referential integrity constraint violations.
   class Jobs(tag: Tag) extends Table[(String, String, Int, String, Timestamp,
-                                      Option[Timestamp], Option[String])] (tag, "JOBS") {
+    Option[Timestamp], Option[String])](tag, "JOBS") {
     def jobId = column[String]("JOB_ID", O.PrimaryKey)
     def contextName = column[String]("CONTEXT_NAME")
-    def jarId = column[Int]("JAR_ID") // FK to JARS table
+    def binId = column[Int]("BIN_ID")
+    // FK to JARS table
     def classPath = column[String]("CLASSPATH")
     def startTime = column[Timestamp]("START_TIME")
     def endTime = column[Option[Timestamp]]("END_TIME")
     def error = column[Option[String]]("ERROR")
-    def * = (jobId, contextName, jarId, classPath, startTime, endTime, error)
+    def * = (jobId, contextName, binId, classPath, startTime, endTime, error)
   }
+
   val jobs = TableQuery[Jobs]
 
   class Configs(tag: Tag) extends Table[(String, String)](tag, "CONFIGS") {
@@ -59,6 +68,7 @@ class JobSqlDAO(config: Config) extends JobDAO {
     def jobConfig = column[String]("JOB_CONFIG")
     def * = (jobId, jobConfig)
   }
+
   //scalastyle:on
   val configs = TableQuery[Configs]
 
@@ -66,21 +76,28 @@ class JobSqlDAO(config: Config) extends JobDAO {
   val jdbcUrl = config.getString("spark.jobserver.sqldao.jdbc.url")
   val jdbcUser = config.getString("spark.jobserver.sqldao.jdbc.user")
   val jdbcPassword = config.getString("spark.jobserver.sqldao.jdbc.password")
-  val dbcpMaxActive = config.getInt("spark.jobserver.sqldao.dbcp.maxactive")
-  val dbcpMaxIdle = config.getInt("spark.jobserver.sqldao.dbcp.maxidle")
-  val dbcpInitialSize = config.getInt("spark.jobserver.sqldao.dbcp.initialsize")
-  val dataSource: DataSource = {
-    val ds = new BasicDataSource
-    ds.setDriverClassName(jdbcDriverClass)
-    ds.setUsername(jdbcUser)
-    ds.setPassword(jdbcPassword)
-    ds.setMaxActive(dbcpMaxActive)
-    ds.setMaxIdle(dbcpMaxIdle)
-    ds.setInitialSize(dbcpInitialSize)
-    ds.setUrl(jdbcUrl)
-    ds
+  val enableDbcp = config.getBoolean("spark.jobserver.sqldao.dbcp.enabled")
+  val db = if (enableDbcp) {
+    logger.info("DBCP enabled")
+    val dbcpMaxActive = config.getInt("spark.jobserver.sqldao.dbcp.maxactive")
+    val dbcpMaxIdle = config.getInt("spark.jobserver.sqldao.dbcp.maxidle")
+    val dbcpInitialSize = config.getInt("spark.jobserver.sqldao.dbcp.initialsize")
+    val dataSource: DataSource = {
+      val ds = new BasicDataSource
+      ds.setDriverClassName(jdbcDriverClass)
+      ds.setUsername(jdbcUser)
+      ds.setPassword(jdbcPassword)
+      ds.setMaxActive(dbcpMaxActive)
+      ds.setMaxIdle(dbcpMaxIdle)
+      ds.setInitialSize(dbcpInitialSize)
+      ds.setUrl(jdbcUrl)
+      ds
+    }
+    Database.forDataSource(dataSource)
+  } else {
+    logger.info("DBCP disabled")
+    Database.forURL(jdbcUrl, driver = jdbcDriverClass, user = jdbcUser, password = jdbcPassword)
   }
-  val db = Database.forDataSource(dataSource)
   // TODO: migrateLocations should be removed when tests have a running configuration
   val migrateLocations = config.getString("flyway.locations")
 
@@ -89,11 +106,7 @@ class JobSqlDAO(config: Config) extends JobDAO {
 
   private def init() {
     // Create the data directory if it doesn't exist
-    if (!rootDirFile.exists()) {
-      if (!rootDirFile.mkdirs()) {
-        throw new RuntimeException("Could not create directory " + rootDir)
-      }
-    }
+    initFileDirectory()
 
     // Flyway migration
     val flyway = new Flyway()
@@ -103,205 +116,175 @@ class JobSqlDAO(config: Config) extends JobDAO {
     flyway.migrate()
   }
 
-  override def saveJar(appName: String, uploadTime: DateTime, jarBytes: Array[Byte]) {
+  override def saveBinary(appName: String,
+                          binaryType: BinaryType,
+                          uploadTime: DateTime,
+                          binBytes: Array[Byte]) {
     // The order is important. Save the jar file first and then log it into database.
-    cacheJar(appName, uploadTime, jarBytes)
+    cacheBinary(appName, binaryType, uploadTime, binBytes)
 
     // log it into database
-    val jarId = insertJarInfo(JarInfo(appName, uploadTime), jarBytes)
+    if (Await.result(insertBinaryInfo(
+      BinaryInfo(appName, binaryType, uploadTime),
+      binBytes), 60 seconds) == 0) {
+      throw new SlickException(s"Failed to insert binary: $appName " +
+        s"of type ${binaryType.name} into database at $uploadTime")
+    }
   }
 
-  override def getApps: Map[String, DateTime] = {
-    db withSession {
-      implicit session =>
-
-      // It's "select appName, max(uploadTime) from jars group by appName
-      // max(uploadTime) is the latest upload time of the jar.
-        val query = jars.groupBy { _.appName }.map {
-          case (appName, jar) => (appName -> jar.map(_.uploadTime).max.get)
-        }
-
-        query.list.map {
-          case (appName: String, timestamp: Timestamp) =>
-            (appName, convertDateSqlToJoda(timestamp))
-        }.toMap
+  override def getApps: Future[Map[String, (BinaryType, DateTime)]] = {
+    val query = binaries.groupBy { r =>
+      (r.appName, r.binaryType)
+    }.map {
+      case ((appName, binaryType), bin) =>
+        (appName, binaryType,  bin.map(_.uploadTime).max.get)
+    }.result
+    for (m <- db.run(query)) yield {
+      m.map {
+        case (appName, binaryType, uploadTime) =>
+          (appName, (BinaryType.fromString(binaryType), convertDateSqlToJoda(uploadTime)))
+      }.toMap
     }
   }
 
   // Insert JarInfo and its jar into db and return the primary key associated with that row
-  private def insertJarInfo(jarInfo: JarInfo, jarBytes: Array[Byte]): Int = {
-    // Must provide a value that will be ignored because the JARS jobId column
-    // is tagged with O.AutoInc
-    val IGNORED_VAL = -1
-
-    db withSession {
-      implicit session =>
-
-        (jars returning jars.map(_.jarId)) +=
-          (IGNORED_VAL, jarInfo.appName, convertDateJodaToSql(jarInfo.uploadTime), jarBytes)
-    }
+  private def insertBinaryInfo(binInfo: BinaryInfo, binBytes: Array[Byte]): Future[Int] = {
+    db.run(binaries.map(j => j.*) += (
+      -1,
+      binInfo.appName,
+      binInfo.binaryType.name,
+      convertDateJodaToSql(binInfo.uploadTime),
+      binBytes))
   }
 
-  override def retrieveJarFile(appName: String, uploadTime: DateTime): String = {
-    val jarFile = new File(rootDir, createJarName(appName, uploadTime) + ".jar")
-    if (!jarFile.exists()) {
-      fetchAndCacheJarFile(appName, uploadTime)
+  override def retrieveBinaryFile(appName: String, binaryType: BinaryType, uploadTime: DateTime): String = {
+    val binFile = new File(rootDir, createBinaryName(appName, binaryType, uploadTime))
+    if (!binFile.exists()) {
+      fetchAndCacheBinFile(appName, binaryType, uploadTime)
     }
-    jarFile.getAbsolutePath
+    binFile.getAbsolutePath
   }
 
   // Fetch the jar file from database and cache it into local file system.
-  private def fetchAndCacheJarFile(appName: String, uploadTime: DateTime) {
-    val jarBytes = fetchJar(appName, uploadTime)
-    cacheJar(appName, uploadTime, jarBytes)
+  private def fetchAndCacheBinFile(appName: String, binaryType: BinaryType, uploadTime: DateTime) {
+    val jarBytes = Await.result(fetchBinary(appName, binaryType, uploadTime), 60 seconds)
+    cacheBinary(appName, binaryType, uploadTime, jarBytes)
   }
 
   // Fetch the jar from the database
-  private def fetchJar(appName: String, uploadTime: DateTime): Array[Byte] = {
-    db withSession {
-      implicit session =>
-
-        val dateTime = convertDateJodaToSql(uploadTime)
-        val query = jars.filter { jar =>
-          jar.appName === appName && jar.uploadTime === dateTime
-        }.map( _.jar )
-
-        // TODO: check if this list is empty?
-        query.list.head
-    }
-  }
-
-  // Fetch the primary key for a particular jar from the database
-  // TODO: Might not be needed but was very quick to implement
-  private def fetchJarId(appName: String, uploadTime: DateTime): Int = {
-    db withSession {
-      implicit session =>
-
-        queryJarId(appName, uploadTime)
-    }
-  }
-
-  private def queryJarId(appName: String, uploadTime: DateTime)(implicit session: Session): Int = {
+  private def fetchBinary(appName: String,
+                          binaryType: BinaryType,
+                          uploadTime: DateTime): Future[Array[Byte]] = {
     val dateTime = convertDateJodaToSql(uploadTime)
-    val query = jars.filter { jar =>
-      jar.appName === appName && jar.uploadTime === dateTime
-    }.map( _.jarId )
-
-    query.list.head
+    val query = binaries.filter { bin =>
+      bin.appName === appName && bin.uploadTime === dateTime && bin.binaryType === binaryType.name
+    }.map(_.binary).result
+    db.run(query.head)
   }
 
-  // Cache the jar file into local file system.
-  private def cacheJar(appName: String, uploadTime: DateTime, jarBytes: Array[Byte]) {
-    val outFile = new File(rootDir, createJarName(appName, uploadTime) + ".jar")
-    val bos = new BufferedOutputStream(new FileOutputStream(outFile))
-    try {
-      logger.debug("Writing {} bytes to file {}", jarBytes.size, outFile.getPath)
-      bos.write(jarBytes)
-      bos.flush()
-    } finally {
-      bos.close()
-    }
+  private def queryBinaryId(appName: String, binaryType: BinaryType, uploadTime: DateTime): Future[Int] = {
+    val dateTime = convertDateJodaToSql(uploadTime)
+    val query = binaries.filter { bin =>
+      bin.appName === appName && bin.uploadTime === dateTime && bin.binaryType === binaryType.name
+    }.map(_.binId).result
+    db.run(query.head)
   }
 
-  private def createJarName(appName: String, uploadTime: DateTime): String = appName + "-" + uploadTime
+
 
   // Convert from joda DateTime to java.sql.Timestamp
-  private def convertDateJodaToSql(dateTime: DateTime): Timestamp =
-    new Timestamp(dateTime.getMillis())
+  private def convertDateJodaToSql(dateTime: DateTime): Timestamp = new Timestamp(dateTime.getMillis)
 
   // Convert from java.sql.Timestamp to joda DateTime
-  private def convertDateSqlToJoda(timestamp: Timestamp): DateTime =
-    new DateTime(timestamp.getTime())
+  private def convertDateSqlToJoda(timestamp: Timestamp): DateTime = new DateTime(timestamp.getTime)
 
-  override def getJobConfigs: Map[String, Config] = {
-    db withSession {
-      implicit sessions =>
-
-        configs.list.map { case (jobId, jobConfig) =>
-          (jobId -> ConfigFactory.parseString(jobConfig))
-        }.toMap
+  override def getJobConfigs: Future[Map[String, Config]] = {
+    for (r <- db.run(configs.result)) yield {
+      r.map {
+        case (jobId, jobConfig) => jobId -> ConfigFactory.parseString(jobConfig)
+      }.toMap
     }
   }
 
-  override def saveJobConfig(jobId: String, jobConfig: Config) {
-    db withSession {
-      implicit sessions =>
-
-        configs += (jobId, jobConfig.root().render(ConfigRenderOptions.concise()))
+  override def saveJobConfig(jobId: String, jobConfig: Config): Unit = {
+    val configRender = jobConfig.root().render(ConfigRenderOptions.concise())
+    if(Await.result(db.run(configs.map(c => c.*) += (jobId, configRender)), 60 seconds) == 0){
+      throw new SlickException(s"Could not insert $jobId into database")
     }
   }
 
-  override def saveJobInfo(jobInfo: JobInfo) {
-    db withSession {
-      implicit sessions =>
-
-        // First, query JARS table for a jarId
-        val jarId = queryJarId(jobInfo.jarInfo.appName, jobInfo.jarInfo.uploadTime)
-
-        // Extract out the the JobInfo members and convert any members to appropriate SQL types
-        val JobInfo(jobId, contextName, _, classPath, startTime, endTime, error) = jobInfo
-        val (start, endOpt, errOpt) = (convertDateJodaToSql(startTime),
-          endTime.map(convertDateJodaToSql(_)),
-          error.map(_.getMessage))
-
-        // When you run a job asynchronously, the same data is written twice with a different
-        // endTime and error value. When the row does not exists we write the data as new, otherwise,
-        // we want to update the row.
-        val updateQuery = jobs.filter(_.jobId === jobId).map(job => (job.endTime, job.error))
-
-        updateQuery.list.size match {
-          case 0 => jobs += (jobId, contextName, jarId, classPath, start, endOpt, errOpt)
-          case _ => updateQuery.update(endOpt, errOpt)
-        }
+  override def saveJobInfo(jobInfo: JobInfo): Unit = {
+    val jarId =
+      Await.result(
+        queryBinaryId(
+          jobInfo.binaryInfo.appName,
+          jobInfo.binaryInfo.binaryType,
+          jobInfo.binaryInfo.uploadTime),
+        60 seconds)
+    val startTime = convertDateJodaToSql(jobInfo.startTime)
+    val endTime = jobInfo.endTime.map(t => convertDateJodaToSql(t))
+    val errors = jobInfo.error.map(e => e.getMessage)
+    val row = (jobInfo.jobId, jobInfo.contextName, jarId, jobInfo.classPath, startTime, endTime, errors)
+    if(Await.result(db.run(jobs.insertOrUpdate(row)), 60 seconds) == 0){
+      throw new SlickException(s"Could not update ${jobInfo.jobId} in the database")
     }
   }
 
-  override def getJobInfos(limit: Int): Seq[JobInfo] = {
-    db withSession {
-      implicit sessions =>
+  override def getJobInfos(limit: Int, statusOpt: Option[String] = None): Future[Seq[JobInfo]] = {
 
-        // Join the JARS and JOBS tables without unnecessary columns
-        val joinQuery = for {
-          jar <- jars
-          j <- jobs if j.jarId === jar.jarId
-        } yield
-          (j.jobId, j.contextName, jar.appName, jar.uploadTime, j.classPath, j.startTime, j.endTime, j.error)
-        val sortQuery = joinQuery.sortBy(_._6.desc)
-        val limitQuery = sortQuery.take(limit)
-        // Transform the each row of the table into a map of JobInfo values
-        limitQuery.list.map {
-          case (id, context, app, upload, classpath, start, end, err) =>
-            JobInfo(id,
-              context,
-              JarInfo(app, convertDateSqlToJoda(upload)),
-              classpath,
-              convertDateSqlToJoda(start),
-              end.map(convertDateSqlToJoda(_)),
-              err.map(new Throwable(_)))
-        }.toSeq
+    val joinQuery = for {
+      bin <- binaries
+      j <- jobs if j.binId === bin.binId && (statusOpt match {
+                          // !endTime.isDefined
+                          case Some(JobStatus.Running) => !j.endTime.isDefined && !j.error.isDefined
+                          // endTime.isDefined && error.isDefined
+                          case Some(JobStatus.Error) =>  j.error.isDefined
+                          // not RUNNING AND NOT ERROR
+                          case Some(JobStatus.Finished) => j.endTime.isDefined && !j.error.isDefined
+                          case _ => true
+                })
+    } yield {
+      (j.jobId, j.contextName, bin.appName, bin.binaryType,
+        bin.uploadTime, j.classPath, j.startTime, j.endTime, j.error)
+    }
+    val sortQuery = joinQuery.sortBy(_._6.desc)
+    val limitQuery = sortQuery.take(limit)
+    // Transform the each row of the table into a map of JobInfo values
+    for (r <- db.run(limitQuery.result)) yield {
+      r.map { case (id, context, app, binType, upload, classpath, start, end, err) =>
+        JobInfo(
+          id,
+          context,
+          BinaryInfo(app, BinaryType.fromString(binType), convertDateSqlToJoda(upload)),
+          classpath,
+          convertDateSqlToJoda(start),
+          end.map(convertDateSqlToJoda),
+          err.map(new Throwable(_)))
+      }
     }
   }
 
-  override def getJobInfo(jobId: String): Option[JobInfo] = {
-    db withSession {
-      implicit sessions =>
+  override def getJobInfo(jobId: String): Future[Option[JobInfo]] = {
 
-        // Join the JARS and JOBS tables without unnecessary columns
-        val joinQuery = for {
-          jar <- jars
-          j <- jobs if j.jarId === jar.jarId && j.jobId === jobId
-        } yield
-          (j.jobId, j.contextName, jar.appName, jar.uploadTime, j.classPath, j.startTime,
-            j.endTime, j.error)
-        joinQuery.list.map { case (id, context, app, upload, classpath, start, end, err) =>
-          JobInfo(id,
-            context,
-            JarInfo(app, convertDateSqlToJoda(upload)),
-            classpath,
-            convertDateSqlToJoda(start),
-            end.map(convertDateSqlToJoda(_)),
-            err.map(new Throwable(_)))
-        }.headOption
+    // Join the BINARIES and JOBS tables without unnecessary columns
+    val joinQuery = for {
+      bin <- binaries
+      j <- jobs if j.binId === bin.binId && j.jobId === jobId
+    } yield {
+      (j.jobId, j.contextName, bin.appName, bin.binaryType, bin.uploadTime, j.classPath, j.startTime,
+        j.endTime, j.error)
+    }
+    for (r <- db.run(joinQuery.result)) yield {
+      r.map { case (id, context, app, binType, upload, classpath, start, end, err) =>
+        JobInfo(id,
+          context,
+          BinaryInfo(app, BinaryType.fromString(binType), convertDateSqlToJoda(upload)),
+          classpath,
+          convertDateSqlToJoda(start),
+          end.map(convertDateSqlToJoda),
+          err.map(new Throwable(_)))
+      }.headOption
+
     }
   }
 }

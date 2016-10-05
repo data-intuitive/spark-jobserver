@@ -2,7 +2,7 @@ package spark.jobserver
 
 import akka.actor.{Props, ActorRef, ActorSystem}
 import akka.testkit.{TestKit, ImplicitSender}
-import spark.jobserver.io.{JobDAOActor, JarInfo, JobInfo, JobDAO}
+import spark.jobserver.io._
 import org.joda.time.DateTime
 import org.scalatest.Matchers
 import org.scalatest.{FunSpecLike, BeforeAndAfter, BeforeAndAfterAll}
@@ -20,7 +20,7 @@ with FunSpecLike with Matchers with BeforeAndAfter with BeforeAndAfterAll {
   private val jobId = "jobId"
   private val contextName = "contextName"
   private val appName = "appName"
-  private val jarInfo = JarInfo(appName, DateTime.now)
+  private val jarInfo = BinaryInfo(appName, BinaryType.Jar, DateTime.now)
   private val classPath = "classPath"
   private val jobInfo = JobInfo(jobId, contextName, jarInfo, classPath, DateTime.now, None, None)
 
@@ -64,7 +64,7 @@ with FunSpecLike with Matchers with BeforeAndAfter with BeforeAndAfterAll {
     it("should be informed JobStarted until it is unsubscribed") {
       actor ! JobInit(jobInfo)
       actor ! Subscribe(jobId, self, Set(classOf[JobStarted]))
-      val msg = JobStarted(jobId, contextName, DateTime.now)
+      val msg = JobStarted(jobId, jobInfo)
       actor ! msg
       expectMsg(msg)
 
@@ -72,7 +72,7 @@ with FunSpecLike with Matchers with BeforeAndAfter with BeforeAndAfterAll {
       expectMsg(msg)
 
       actor ! Unsubscribe(jobId, self)
-      actor ! JobStarted(jobId, contextName, DateTime.now)
+      actor ! JobStarted(jobId, jobInfo)
       expectNoMsg()   // shouldn't get it again
 
       actor ! Unsubscribe(jobId, self)
@@ -82,7 +82,7 @@ with FunSpecLike with Matchers with BeforeAndAfter with BeforeAndAfterAll {
     it("should be ok to subscribe beofore job init") {
       actor ! Subscribe(jobId, self, Set(classOf[JobStarted]))
       actor ! JobInit(jobInfo)
-      val msg = JobStarted(jobId, contextName, DateTime.now)
+      val msg = JobStarted(jobId, jobInfo)
       actor ! msg
       expectMsg(msg)
     }
@@ -100,7 +100,7 @@ with FunSpecLike with Matchers with BeforeAndAfter with BeforeAndAfterAll {
 
     it("should be informed JobFinished until it is unsubscribed") {
       actor ! JobInit(jobInfo)
-      actor ! JobStarted(jobId, contextName, DateTime.now)
+      actor ! JobStarted(jobId, jobInfo)
       actor ! Subscribe(jobId, self, Set(classOf[JobFinished]))
       val msg = JobFinished(jobId, DateTime.now)
       actor ! msg
@@ -112,7 +112,7 @@ with FunSpecLike with Matchers with BeforeAndAfter with BeforeAndAfterAll {
 
     it("should be informed JobErroredOut until it is unsubscribed") {
       actor ! JobInit(jobInfo)
-      actor ! JobStarted(jobId, contextName, DateTime.now)
+      actor ! JobStarted(jobId, jobInfo)
       actor ! Subscribe(jobId, self, Set(classOf[JobErroredOut]))
       val msg = JobErroredOut(jobId, DateTime.now, new Throwable)
       actor ! msg
@@ -128,7 +128,7 @@ with FunSpecLike with Matchers with BeforeAndAfter with BeforeAndAfterAll {
       expectMsg(Seq(jobInfo))
 
       val startTime = DateTime.now
-      actor ! JobStarted(jobId, contextName, startTime)
+      actor ! JobStarted(jobId, jobInfo.copy(startTime=startTime))
       actor ! GetRunningJobStatus
       expectMsg(Seq(JobInfo(jobId, contextName, jarInfo, classPath, startTime, None, None)))
 
@@ -154,7 +154,7 @@ with FunSpecLike with Matchers with BeforeAndAfter with BeforeAndAfterAll {
       actor ! JobInit(jobInfo)
 
       val startTime = DateTime.now
-      actor ! JobStarted(jobId, contextName, startTime)
+      actor ! JobStarted(jobId, jobInfo)
 
       val failedTime = DateTime.now
       val err = new Throwable

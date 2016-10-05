@@ -1,5 +1,6 @@
 package spark.jobserver
 
+import scala.util.{ Try, Success, Failure }
 import com.typesafe.config.ConfigFactory
 import org.apache.spark.sql.Row
 import org.apache.spark.{SparkContext, SparkConf}
@@ -9,8 +10,15 @@ import spark.jobserver.context.{HiveContextLike, HiveContextFactory}
 import spark.jobserver.io.{JobDAO, JobDAOActor}
 
 class TestHiveContextFactory extends HiveContextFactory {
-  override protected def contextFactory(conf: SparkConf): C =
-    new TestHiveContext(new SparkContext(conf)) with HiveContextLike
+  override protected def contextFactory(conf: SparkConf): C = {
+    val sc = new SparkContext(conf)
+    Try(new TestHiveContext(sc) with HiveContextLike) match {
+      case Success(hc) => hc
+      case Failure(e) =>
+        sc.stop
+        throw e
+    }
+  }
 }
 
 object HiveJobSpec extends JobSpecConfig {
@@ -34,12 +42,13 @@ class HiveJobSpec extends ExtrasJobSpecBase(HiveJobSpec.getNewSystem) {
     dao = new InMemoryDAO
     daoActor = system.actorOf(JobDAOActor.props(dao))
     manager = system.actorOf(JobManagerActor.props(
-                             HiveJobSpec.getContextConfig(false, HiveJobSpec.contextConfig)))
+      HiveJobSpec.getContextConfig(false, HiveJobSpec.contextConfig),
+      daoActor))
   }
 
   describe("Spark Hive Jobs") {
     it("should be able to create a Hive table, then query it using separate Hive-SQL jobs") {
-      manager ! JobManagerActor.Initialize(daoActor, None)
+      manager ! JobManagerActor.Initialize(None)
       expectMsgClass(30 seconds, classOf[JobManagerActor.Initialized])
 
       uploadTestJar()

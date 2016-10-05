@@ -1,31 +1,27 @@
 package spark.jobserver
 
-import akka.actor.{ ActorRef, ActorSystem, Props }
-import akka.testkit.{ ImplicitSender, TestKit }
 import com.typesafe.config.{ Config, ConfigFactory, ConfigValueFactory }
 import akka.testkit.TestProbe
-import spark.jobserver.CommonMessages.{ JobErroredOut, JobResult }
+import spark.jobserver.CommonMessages.JobResult
 import spark.jobserver.io.JobDAOActor
-import collection.JavaConversions._
 
 class NamedObjectsJobSpec extends JobSpecBase(JobManagerSpec.getNewSystem) {
 
-  //private val emptyConfig = ConfigFactory.parseString("spark.jobserver.named-object-creation-timeout = 60 s")
-
-  before {
+  override def beforeAll() {
     dao = new InMemoryDAO
     daoActor = system.actorOf(JobDAOActor.props(dao))
-    manager = system.actorOf(JobManagerActor.props(JobManagerSpec.getContextConfig(adhoc = false)))
+    manager = system.actorOf(JobManagerActor.props(
+      JobManagerSpec.getContextConfig(adhoc = false),
+      daoActor))
     supervisor = TestProbe().ref
 
-    manager ! JobManagerActor.Initialize(daoActor, None)
+    manager ! JobManagerActor.Initialize(None)
     
     expectMsgClass(classOf[JobManagerActor.Initialized])
 
     uploadTestJar()
-
   }
-
+  
   val jobName = "spark.jobserver.NamedObjectsTestJob"
 
   private def getCreateConfig(createDF: Boolean, createRDD: Boolean, createBroadcast: Boolean = false) : Config = {
@@ -42,7 +38,6 @@ class NamedObjectsJobSpec extends JobSpecBase(JobManagerSpec.getNewSystem) {
   
   describe("NamedObjects (RDD)") {
     it("should survive from one job to another one") {
-
       manager ! JobManagerActor.StartJob("demo", jobName, getCreateConfig(false, true), errorEvents ++ syncEvents)
       val JobResult(_, names: Array[String]) = expectMsgClass(classOf[JobResult])
       names should contain("rdd1")
@@ -64,7 +59,6 @@ class NamedObjectsJobSpec extends JobSpecBase(JobManagerSpec.getNewSystem) {
 
   describe("NamedObjects (DataFrame)") {
     it("should survive from one job to another one") {
-
       manager ! JobManagerActor.StartJob("demo", jobName, getCreateConfig(true, false), errorEvents ++ syncEvents)
       val JobResult(_, names: Array[String]) = expectMsgClass(classOf[JobResult])
 
@@ -77,13 +71,12 @@ class NamedObjectsJobSpec extends JobSpecBase(JobManagerSpec.getNewSystem) {
       
       //clean-up
       manager ! JobManagerActor.StartJob("demo", jobName, getDeleteConfig(List("df1")), errorEvents ++ syncEvents)
-      val JobResult(_, names3: Array[String]) = expectMsgClass(classOf[JobResult])
+      expectMsgClass(classOf[JobResult])
     }
   }
 
   describe("NamedObjects (DataFrame + RDD)") {
     it("should survive from one job to another one") {
-
       manager ! JobManagerActor.StartJob("demo", jobName, getCreateConfig(true, true), errorEvents ++ syncEvents)
       val JobResult(_, names: Array[String]) = expectMsgClass(classOf[JobResult])
       
@@ -97,7 +90,7 @@ class NamedObjectsJobSpec extends JobSpecBase(JobManagerSpec.getNewSystem) {
       
       //clean-up
       manager ! JobManagerActor.StartJob("demo", jobName, getDeleteConfig(List("rdd1", "df1")), errorEvents ++ syncEvents)
-      val JobResult(_, names3: Array[String]) = expectMsgClass(classOf[JobResult])
+      expectMsgClass(classOf[JobResult])
     }
   }
 
@@ -119,7 +112,7 @@ class NamedObjectsJobSpec extends JobSpecBase(JobManagerSpec.getNewSystem) {
       //clean-up
       manager ! JobManagerActor.StartJob("demo", jobName, getDeleteConfig(List("rdd1", "df1", "broadcast1"))
         , errorEvents ++ syncEvents)
-      val JobResult(_, names3: Array[String]) = expectMsgClass(classOf[JobResult])
+      expectMsgClass(classOf[JobResult])
     }
   }
 }

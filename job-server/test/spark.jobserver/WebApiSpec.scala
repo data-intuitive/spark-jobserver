@@ -4,7 +4,8 @@ import akka.actor.{Actor, ActorSystem, Props}
 import com.typesafe.config.ConfigFactory
 import org.joda.time.DateTime
 import org.scalatest.{BeforeAndAfterAll, FunSpec, Matchers}
-import spark.jobserver.io.{JarInfo, JobDAOActor, JobInfo}
+import spark.jobserver.JobManagerActor.JobKilledException
+import spark.jobserver.io._
 import spray.routing.HttpService
 import spray.testkit.ScalatestRouteTest
 
@@ -45,8 +46,12 @@ with ScalatestRouteTest with HttpService {
   val routes = api.myRoutes
 
   val dt = DateTime.parse("2013-05-29T00Z")
-  val baseJobInfo = JobInfo("foo-1", "context", JarInfo("demo", dt), "com.abc.meme", dt, None, None)
+  val baseJobInfo =
+    JobInfo("foo-1", "context", BinaryInfo("demo", BinaryType.Jar, dt), "com.abc.meme", dt, None, None)
   val finishedJobInfo = baseJobInfo.copy(endTime = Some(dt.plusMinutes(5)))
+  val errorJobInfo = finishedJobInfo.copy(error =  Some(new Throwable("test-error")))
+  val killedJobInfo = finishedJobInfo.copy(error =  Some(JobKilledException(finishedJobInfo.jobId)))
+  val JobId = "jobId"
   val StatusKey = "status"
   val ResultKey = "result"
   class DummyActor extends Actor {
@@ -85,16 +90,35 @@ with ScalatestRouteTest with HttpService {
       case GetJobStatus("job_to_kill") => sender ! baseJobInfo
       case GetJobStatus(id) => sender ! baseJobInfo
       case GetJobResult(id) => sender ! JobResult(id, id + "!!!")
-      case GetJobStatuses(limitOpt) =>
-        sender ! Seq(baseJobInfo, finishedJobInfo)
+      case GetJobStatuses(limitOpt, statusOpt) => {
+        statusOpt match {
+          case Some(JobStatus.Error) => sender ! Seq(errorJobInfo)
+          case Some(JobStatus.Killed) => sender ! Seq(killedJobInfo)
+          case Some(JobStatus.Finished) => sender ! Seq(finishedJobInfo)
+          case Some(JobStatus.Running) => sender ! Seq(baseJobInfo)
+          case _ => sender ! Seq(baseJobInfo, finishedJobInfo)
+        }
+      }
 
-      case ListJars => sender ! Map("demo1" -> dt, "demo2" -> dt.plusHours(1))
+
+      case ListBinaries(Some(BinaryType.Jar)) =>
+        sender ! Map("demo1" -> (BinaryType.Jar, dt), "demo2" -> (BinaryType.Jar, dt.plusHours(1)))
+
+      case ListBinaries(_) =>
+        sender ! Map(
+          "demo1" -> (BinaryType.Jar, dt),
+          "demo2" -> (BinaryType.Jar, dt.plusHours(1)),
+          "demo3" -> (BinaryType.Egg, dt.plusHours(2))
+        )
       // Ok these really belong to a JarManager but what the heck, type unsafety!!
-      case StoreJar("badjar", _) => sender ! InvalidJar
-      case StoreJar(_, _)        => sender ! JarStored
+      case StoreBinary("badjar", _, _)  => sender ! InvalidBinary
+      case StoreBinary("daofail", _, _) => sender ! BinaryStorageFailure(new Exception("DAO failed to store"))
+      case StoreBinary(_, _, _)         => sender ! BinaryStored
 
-      case DataManagerActor.StoreData("/tmp/fileToRemove", _) => sender ! DataManagerActor.Stored("/tmp/fileToRemove-time-stamp")
       case DataManagerActor.StoreData("errorfileToRemove", _) => sender ! DataManagerActor.Error
+      case DataManagerActor.StoreData(filename, _) => {
+        sender ! DataManagerActor.Stored(filename + "-time-stamp")
+      }
       case DataManagerActor.ListData => sender ! Set("demo1", "demo2")
       case DataManagerActor.DeleteData("/tmp/fileToRemove") => sender ! DataManagerActor.Deleted
       case DataManagerActor.DeleteData("errorfileToRemove") => sender ! DataManagerActor.Error
@@ -103,6 +127,13 @@ with ScalatestRouteTest with HttpService {
       case StopContext("none") => sender ! NoSuchContext
       case StopContext(_)      => sender ! ContextStopped
       case AddContext("one", _) => sender ! ContextAlreadyExists
+      case AddContext("custom-ctx", c) =>
+        // see WebApiMainRoutesSpec => "context routes" =>
+        // "should setup a new context with the correct configurations."
+        c.getInt("test") should be(1)
+        c.getInt("num-cpu-cores") should be(2)
+        c.getInt("override_me") should be(3)
+        sender ! ContextInitialized
       case AddContext(_, _)     => sender ! ContextInitialized
 
       case GetContext("no-context") => sender ! NoSuchContext
@@ -119,16 +150,18 @@ with ScalatestRouteTest with HttpService {
                                                           new IllegalArgumentException("foo")))
       case StartJob("foo", _, config, events)     =>
         statusActor ! Subscribe("foo", sender, events)
-        statusActor ! JobStatusActor.JobInit(JobInfo("foo", "context", null, "", dt, None, None))
-        statusActor ! JobStarted("foo", "context1", dt)
+        val jobInfo = JobInfo("foo", "context", null, "com.abc.meme", dt, None, None)
+        statusActor ! JobStatusActor.JobInit(jobInfo)
+        statusActor ! JobStarted(jobInfo.jobId, jobInfo)
         val map = config.entrySet().asScala.map { entry => entry.getKey -> entry.getValue.unwrapped }.toMap
         if (events.contains(classOf[JobResult])) sender ! JobResult("foo", map)
         statusActor ! Unsubscribe("foo", sender)
 
       case StartJob("foo.stream", _, config, events)     =>
         statusActor ! Subscribe("foo.stream", sender, events)
-        statusActor ! JobStatusActor.JobInit(JobInfo("foo.stream", "context", null, "", dt, None, None))
-        statusActor ! JobStarted("foo.stream", "context1", dt)
+        val jobInfo = JobInfo("foo.stream", "context", null, "", dt, None, None)
+        statusActor ! JobStatusActor.JobInit(jobInfo)
+        statusActor ! JobStarted(jobInfo.jobId, jobInfo)
         val result = "\"1, 2, 3, 4, 5, 6\"".getBytes().toStream
         if (events.contains(classOf[JobResult])) sender ! JobResult("foo.stream", result)
         statusActor ! Unsubscribe("foo.stream", sender)
