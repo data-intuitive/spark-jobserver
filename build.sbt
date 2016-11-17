@@ -121,7 +121,7 @@ lazy val dockerSettings = Seq(
       case "2.11" =>
         """
           |./dev/change-scala-version.sh 2.11 && \
-          |./make-distribution.sh -Dscala-2.11 -Phadoop-2.4 -Phive
+          |./dev/make-distribution.sh -Dscala-2.11 -Phadoop-2.4 -Phive 
         """.stripMargin.trim
       case other => throw new RuntimeException(s"Scala version $other is not supported!")
     }
