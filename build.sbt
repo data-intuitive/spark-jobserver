@@ -37,6 +37,7 @@ lazy val jobServer = Project(id = "job-server", base = file("job-server"))
 lazy val jobServerTestJar = Project(id = "job-server-tests", base = file("job-server-tests"))
   .settings(commonSettings)
   .settings(jobServerTestJarSettings)
+  .settings(publishSettingsTests)
   .dependsOn(jobServerApi)
   .disablePlugins(SbtScalariform)
 
@@ -97,12 +98,14 @@ lazy val jobServerPythonSettings = revolverSettings ++ Assembly.settings ++ publ
   testPython := PythonTasks.testPythonTask(baseDirectory.value),
   buildPython := PythonTasks.buildPythonTask(baseDirectory.value, version.value),
   buildPyExamples := PythonTasks.buildExamplesTask(baseDirectory.value, version.value),
-  assembly <<= assembly.dependsOn(buildPython)
+  assembly <<= assembly.dependsOn(buildPython),
+  // Don't run tests, not stable yet
+  test in assembly := {}
 )
 
 lazy val jobServerTestJarSettings = Seq(
   libraryDependencies ++= sparkDeps ++ apiDeps,
-  publishArtifact := false,
+  publishArtifact := true,
   description := "Test jar for Spark Job Server",
   exportJars := true        // use the jar instead of target/classes
 )
@@ -211,7 +214,7 @@ lazy val commonSettings = Defaults.coreDefaultSettings ++ dirSettings ++ implici
   crossScalaVersions := Seq("2.10.6","2.11.8"),
   scalaVersion := sys.env.getOrElse("SCALA_VERSION", "2.10.6"),
   dependencyOverrides += "org.scala-lang" % "scala-compiler" % scalaVersion.value,
-  publishTo    := Some(Resolver.file("Unused repo", file("target/unusedrepo"))),
+//  publishTo    := Some(Resolver.file("Unused repo", file("target/unusedrepo"))),
   // scalastyleFailOnError := true,
   runScalaStyle := {
     org.scalastyle.sbt.ScalastylePlugin.scalastyle.in(Compile).toTask("").value
@@ -245,9 +248,16 @@ lazy val scoverageSettings = {
 
 lazy val publishSettings = Seq(
   licenses += ("Apache-2.0", url("http://choosealicense.com/licenses/apache/")),
-  bintrayOrganization := Some("spark-jobserver")
+  bintrayOrganization := Some("tverbeiren")
+)
+
+lazy val publishSettingsTests = Seq(
+  licenses += ("Apache-2.0", url("http://choosealicense.com/licenses/apache/")),
+  bintrayOrganization := Some("tverbeiren")
+//  publishTo    := Some("job-server-tests")
 )
 
 // This is here so we can easily switch back to Logback when Spark fixes its log4j dependency.
 lazy val jobServerLogbackLogging = "-Dlogback.configurationFile=config/logback-local.xml"
 lazy val jobServerLogging = "-Dlog4j.configuration=file:config/log4j-local.properties"
+
