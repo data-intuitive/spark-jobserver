@@ -39,7 +39,7 @@ mkdir /tmp/api
 In it, you store the data (ideally in another subdirectory `data` and the assembly jar with the application logic compiled for Spark Jobserver.
 
 ```
-mkdir /tmp/data
+mkdir /tmp/api/data
 ```
 
 ## Starting the Docker container
